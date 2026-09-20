@@ -1,25 +1,41 @@
 import torch
 import torch.nn as nn
 
-# Get data from tokenizer.py
-from tokenizer import vocabulary, token_ids, words
+from tokenizer import vocabulary, encoded_documents, tokenized_documents
 
 
+# Keep random embedding values the same every run
 torch.manual_seed(42)
 
-# Token IDs → Tensor
-ids = torch.tensor(token_ids)
 
 # Create Embedding layer
 embedding = nn.Embedding(
+
+    # Number of unique tokens
     num_embeddings=len(vocabulary),
+
+    # 3 numbers for each token
     embedding_dim=3
 )
 
-# Token IDs → Embedding vectors
-vectors = embedding(ids)
-
 
 if __name__ == "__main__":
-    for word, vector in zip(words, vectors):
-        print(word, "→", vector)
+
+    # Process each document separately
+    for words, token_ids in zip(
+        tokenized_documents,
+        encoded_documents
+    ):
+
+        # Token IDs → Tensor
+        ids = torch.tensor(token_ids)
+
+        # Tensor IDs → Embedding vectors
+        vectors = embedding(ids)
+
+        print("Document:")
+
+        for word, vector in zip(words, vectors):
+            print(word, "→", vector)
+
+        print()
