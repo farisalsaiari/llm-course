@@ -21,6 +21,8 @@ From the repository root:
 python3 jsm/train_tokenizer.py
 python3 jsm/train.py --epochs 20
 python3 jsm/inference.py
+python3 jsm/inference.py "language models"
+python3 jsm/inference.py --interactive
 python3 jsm/evaluate.py
 python3 jsm/debug_shapes.py
 python3 jsm/scale_report.py

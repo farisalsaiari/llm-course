@@ -1,3 +1,4 @@
+import argparse
 import torch
 
 from checkpoint import load_model_checkpoint
@@ -15,6 +16,15 @@ from subword_tokenizer import load_tokenizer
 tokenizer = load_tokenizer()
 vocab_size = tokenizer.get_vocab_size()
 device = get_device()
+
+parser = argparse.ArgumentParser()
+parser.add_argument("prompt", nargs="?", default="i love")
+parser.add_argument("--interactive", action="store_true")
+parser.add_argument("--max-new-tokens", type=int, default=20)
+parser.add_argument("--temperature", type=float, default=0.8)
+parser.add_argument("--top-k", type=int, default=40)
+parser.add_argument("--top-p", type=float, default=0.95)
+args = parser.parse_args()
 
 print("Device:", device)
 
@@ -41,93 +51,64 @@ if model.config.vocab_size != vocab_size:
 model.eval()
 
 
-generated_text = generate(
-    model=model,
-    tokenizer=tokenizer,
-    prompt="i love",
-    max_new_tokens=10,
-    temperature=0.8,
-    top_k=40,
-    top_p=0.95
-)
+def run_prompt(input_text):
 
-print("Generated text:")
-print(generated_text)
-
-
-# -----------------------------------
-# Input Context
-# -----------------------------------
-
-input_text = "i love"
-
-
-# -----------------------------------
-# Words → Token IDs
-# -----------------------------------
-
-input_ids = tokenizer.encode(
-    input_text
-).ids
-
-
-input_tensor = torch.tensor(
-    [input_ids],
-    device=device
-)
-
-
-# -----------------------------------
-# Run Model
-# -----------------------------------
-
-with torch.no_grad():
-
-    logits = model(
-        input_tensor
+    generated_text = generate(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=input_text,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p
     )
 
-    next_token_logits = logits[0, -1]
+    input_ids = tokenizer.encode(input_text).ids
 
+    if not input_ids:
+        print("Enter at least one character.")
+        return
 
-    probabilities = torch.softmax(
-        next_token_logits,
-        dim=0
+    input_tensor = torch.tensor(
+        [input_ids[-model.max_seq_len:]],
+        device=device
     )
 
+    with torch.no_grad():
+        logits = model(input_tensor)
+        probabilities = torch.softmax(logits[0, -1], dim=0)
 
-# -----------------------------------
-# Show Prediction
-# -----------------------------------
-
-print(
-    "Input:",
-    repr(input_text)
-)
-
-print()
-
-print(
-    "Predictions:"
-)
-
-
-top_probabilities, top_ids = torch.topk(
-    probabilities,
-    k=min(5, vocab_size)
-)
-
-for token_id, probability in zip(
-    top_ids.tolist(),
-    top_probabilities.tolist()
-):
-
-    print(
-        repr(tokenizer.id_to_token(token_id)),
-        "→",
-        round(
-            probability * 100,
-            2
-        ),
-        "%"
+    top_probabilities, top_ids = torch.topk(
+        probabilities,
+        k=min(5, vocab_size)
     )
+
+    print("Generated continuation:")
+    print(generated_text)
+    print("Top next-token predictions:")
+
+    for token_id, probability in zip(
+        top_ids.tolist(),
+        top_probabilities.tolist()
+    ):
+        print(
+            repr(tokenizer.id_to_token(token_id)),
+            "→",
+            round(probability * 100, 2),
+            "%"
+        )
+
+
+if args.interactive:
+    print("Enter text for continuation. Type 'exit' to stop.")
+
+    while True:
+        prompt = input("You> ").strip()
+
+        if prompt.lower() in {"exit", "quit"}:
+            break
+
+        run_prompt(prompt)
+        print()
+else:
+    run_prompt(args.prompt)
