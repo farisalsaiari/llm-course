@@ -1,85 +1,37 @@
-import json
 import torch
 
+from checkpoint import load_model_checkpoint
+from device import get_device
+from generation import generate
 from model import TinyModel
+from paths import CHECKPOINT_PATH
+from subword_tokenizer import load_tokenizer
 
 
 # -----------------------------------
-# Load Vocabulary
+# Load Tokenizer
 # -----------------------------------
 
-with open(
-    "artifacts/vocabulary.json",
-    "r",
-    encoding="utf-8"
-) as file:
+tokenizer = load_tokenizer()
+vocab_size = tokenizer.get_vocab_size()
+device = get_device()
 
-    vocabulary = json.load(file)
+print("Device:", device)
 
 
 # -----------------------------------
-# Model Configuration
+# Load Model and Saved Checkpoint
 # -----------------------------------
 
-context_size = 2
-embedding_dim = 3
-
-
-# -----------------------------------
-# Create Model
-# -----------------------------------
-
-model = TinyModel(
-    vocab_size=len(vocabulary),
-    embedding_dim=embedding_dim,
-    context_size=context_size
+model, checkpoint = load_model_checkpoint(
+    path=CHECKPOINT_PATH,
+    model_class=TinyModel,
+    map_location=device
 )
+model = model.to(device)
 
-
-# -----------------------------------
-# Load Saved Checkpoint
-# -----------------------------------
-
-checkpoint = torch.load(
-    "artifacts/tiny_model.pt",
-    weights_only=True
-)
-
-
-# -----------------------------------
-# Load Token Embedding
-# -----------------------------------
-
-model.embedding.load_state_dict(
-    checkpoint["embedding"]
-)
-
-
-# -----------------------------------
-# Load Position Embedding
-# -----------------------------------
-
-model.position_embedding.load_state_dict(
-    checkpoint["position_embedding"]
-)
-
-
-# -----------------------------------
-# Load Self-Attention
-# -----------------------------------
-
-model.attention.load_state_dict(
-    checkpoint["attention"]
-)
-
-
-# -----------------------------------
-# Load Output Layer
-# -----------------------------------
-
-model.output_layer.load_state_dict(
-    checkpoint["output_layer"]
-)
+if model.config.vocab_size != vocab_size:
+    raise ValueError("Checkpoint and tokenizer vocabulary sizes differ.")
 
 
 # -----------------------------------
@@ -89,28 +41,39 @@ model.output_layer.load_state_dict(
 model.eval()
 
 
+generated_text = generate(
+    model=model,
+    tokenizer=tokenizer,
+    prompt="i love",
+    max_new_tokens=10,
+    temperature=0.8,
+    top_k=40,
+    top_p=0.95
+)
+
+print("Generated text:")
+print(generated_text)
+
+
 # -----------------------------------
 # Input Context
 # -----------------------------------
 
-input_words = [
-    "i",
-    "love"
-]
+input_text = "i love"
 
 
 # -----------------------------------
 # Words → Token IDs
 # -----------------------------------
 
-input_ids = [
-    vocabulary[word]
-    for word in input_words
-]
+input_ids = tokenizer.encode(
+    input_text
+).ids
 
 
 input_tensor = torch.tensor(
-    input_ids
+    [input_ids],
+    device=device
 )
 
 
@@ -124,9 +87,11 @@ with torch.no_grad():
         input_tensor
     )
 
+    next_token_logits = logits[0, -1]
+
 
     probabilities = torch.softmax(
-        logits,
+        next_token_logits,
         dim=0
     )
 
@@ -137,7 +102,7 @@ with torch.no_grad():
 
 print(
     "Input:",
-    input_words
+    repr(input_text)
 )
 
 print()
@@ -147,16 +112,21 @@ print(
 )
 
 
-for word, probability in zip(
-    vocabulary.keys(),
-    probabilities
+top_probabilities, top_ids = torch.topk(
+    probabilities,
+    k=min(5, vocab_size)
+)
+
+for token_id, probability in zip(
+    top_ids.tolist(),
+    top_probabilities.tolist()
 ):
 
     print(
-        word,
+        repr(tokenizer.id_to_token(token_id)),
         "→",
         round(
-            probability.item() * 100,
+            probability * 100,
             2
         ),
         "%"
