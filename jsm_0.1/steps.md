@@ -1,0 +1,8 @@
+python -m venv .venv
+on Windows:
+.venv\Scripts\activate
+
+on macOS/Linux:
+source .venv/bin/activate
+
+pip install torch
