@@ -1,42 +1,26 @@
-import json
-from datetime import datetime, timezone
+"""Quarantine holds control references, never copies or moves incoming objects."""
 from pathlib import Path
 
 from paths import QUARANTINE_DIR
-from src.inspection.result import InspectionResult
+from src.inspection.report import publish_record, utc_now
+from src.inspection.result import InspectionDecision as D, InspectionResult
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def quarantine_batch(
-    batch_dir: Path,
-    result: InspectionResult,
-) -> Path:
-    quarantine_dir = QUARANTINE_DIR / batch_dir.name
-    quarantine_dir.mkdir(parents=True, exist_ok=True)
-
-    record_path = quarantine_dir / "quarantine.json"
-
-    if record_path.exists():
-        return record_path
-
+def quarantine_batch(batch_dir: Path, result: InspectionResult, inspection_id: str,
+                     quarantine_dir: Path = QUARANTINE_DIR) -> Path | None:
+    references = [
+        {'batch_id': result.batch_id, 'artifact_id': a.artifact_id,
+         'decision': a.decision, 'reason': a.errors,
+         'inspection_id': inspection_id,
+         'source_reference': str(Path(batch_dir).absolute() / a.stored_relative_path)}
+        for a in result.artifacts if a.decision != D.ACCEPTED
+    ]
+    if not references and result.batch_valid:
+        return None
     record = {
-        "schema_version": "1.0.0",
-        "record_type": "quarantine_record",
-        "batch_id": batch_dir.name,
-        "quarantined_at": utc_now(),
-        "source_batch": batch_dir.as_posix(),
-        "errors": result.errors,
+        'schema_version': '2.0.0', 'record_type': 'quarantine_record',
+        'inspection_id': inspection_id, 'batch_id': result.batch_id,
+        'created_at': utc_now(), 'incoming_batch': str(Path(batch_dir).absolute()),
+        'batch_errors': result.errors, 'artifacts': references,
     }
-
-    with record_path.open("x", encoding="utf-8") as file:
-        json.dump(
-            record,
-            file,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-    return record_path
+    return publish_record(quarantine_dir / result.batch_id, inspection_id, 'quarantine.json', record)

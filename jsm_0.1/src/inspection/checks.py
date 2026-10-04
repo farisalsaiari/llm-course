@@ -1,925 +1,450 @@
+"""Filesystem, content, integrity, and chunked malware checks."""
+import codecs
+import errno
 import hashlib
+import io
 import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import tempfile
 import zipfile
-import xml.etree.ElementTree as ET
-from pathlib import Path
+import zlib
+from contextlib import contextmanager
+from dataclasses import replace
+from pathlib import Path, PurePosixPath
 
-from src.inspection.config import load_inspection_config
-from src.inspection.result import InspectionResult
-
+from src.inspection.deep_inspection import (
+    CHUNK, DEEP_EXTENSIONS, ZIP_FORMATS, UnsafeContent, bounded_zip,
+    inspect_deep_container,
+)
 from src.inspection.result import (
-    InspectionResult,
-    CheckResult,
-    ArtifactInspectionResult,
+    ArtifactInspectionResult, CheckResult, InspectionDecision as D,
+    MalwareScanResult, MalwareScanStatus as M, more_restrictive_decision,
 )
 
-TEXT_EXTENSIONS = {
-    ".txt",
-    ".md",
-    ".json",
-    ".csv",
-    ".xml",
-    ".html",
-    ".htm",
-}
+TEXT_EXTENSIONS = {'.txt', '.text', '.md', '.markdown', '.csv', '.tsv', '.json',
+                   '.jsonl', '.ndjson', '.html', '.htm', '.xml', '.yaml', '.yml', '.log'}
 
 
-SIGNATURES = {
-    "pdf": b"%PDF-",
-    "zip": b"PK",
-}
+@contextmanager
+def _windows_regular(path):
+    """Open reparse points themselves; retain parents without delete sharing."""
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    create = kernel.CreateFileW
+    create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                       wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    create.restype = wintypes.HANDLE
+    close = kernel.CloseHandle
+    close.argtypes = [wintypes.HANDLE]
+    close.restype = wintypes.BOOL
+    information = kernel.GetFileInformationByHandle
+    information.argtypes = [wintypes.HANDLE, wintypes.LPVOID]
+    information.restype = wintypes.BOOL
+    parents = []
+    leaf = None
+    try:
+        for component in (*reversed(path.parents), path):
+            is_leaf = component == path
+            # OPEN_EXISTING, BACKUP_SEMANTICS | OPEN_REPARSE_POINT.
+            handle = create(str(component), 0x80000000 if is_leaf else 0,
+                            1 if is_leaf else 3, None, 3, 0x02200000, None)
+            if handle == ctypes.c_void_p(-1).value:
+                raise ctypes.WinError(ctypes.get_last_error())
+            if is_leaf:
+                leaf = handle
+            else:
+                parents.append(handle)
+            # BY_HANDLE_FILE_INFORMATION is thirteen DWORDs; attributes first.
+            metadata = (wintypes.DWORD * 13)()
+            if not information(handle, ctypes.byref(metadata)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if metadata[0] & 0x400:
+                raise UnsafeContent('symlink/reparse point in artifact path')
+            if not is_leaf and not metadata[0] & 0x10:
+                raise UnsafeContent('non-directory parent in artifact path')
+        descriptor = msvcrt.open_osfhandle(leaf, os.O_RDONLY | os.O_BINARY)
+        leaf = None  # Ownership transferred to the CRT descriptor.
+        with os.fdopen(descriptor, 'rb') as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise UnsafeContent('not a regular file')
+            yield stream
+    finally:
+        if leaf is not None:
+            close(leaf)
+        for handle in reversed(parents):
+            close(handle)
 
 
-def _sha256_file(
-    path: Path,
-    chunk_size: int = 1024 * 1024,
-) -> str:
+@contextmanager
+def open_regular(path):
+    """Reject links at every component; pin parent directories on POSIX."""
+    path = Path(path).absolute()
+    if os.name == 'nt':
+        with _windows_regular(path) as stream:
+            yield stream
+        return
+    descriptor = None
+    parent = None
+    try:
+        if os.open in os.supports_dir_fd and hasattr(os, 'O_NOFOLLOW'):
+            parent = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
+            for part in path.parts[1:-1]:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+                os.close(parent)
+                parent = child
+            descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        else:
+            raise OSError('safe no-follow file opening unavailable on this platform')
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError('not a regular file')
+        with os.fdopen(descriptor, 'rb') as stream:
+            descriptor = None
+            yield stream
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if parent is not None:
+            os.close(parent)
+
+
+def safe_artifact_path(batch_dir, relative):
+    parts = PurePosixPath(relative).parts
+    if (len(parts) != 2 or parts[0] != 'objects' or parts[1] in {'.', '..'}
+            or '\\' in relative or ':' in relative or any(ord(c) < 32 for c in relative)
+            or relative != '/'.join(parts)):
+        raise UnsafeContent('unsafe stored_relative_path; expected objects/<filename>')
+    return batch_dir / relative
+
+
+def stream_hash(stream, max_bytes, destination=None):
+    stream.seek(0)
     digest = hashlib.sha256()
-
-    with path.open("rb") as file:
-        while chunk := file.read(chunk_size):
-            digest.update(chunk)
-
+    size = 0
+    while chunk := stream.read(CHUNK):
+        size += len(chunk)
+        if size > max_bytes:
+            raise OSError('artifact grew during inspection')
+        digest.update(chunk)
+        if destination is not None:
+            destination.write(chunk)
     return digest.hexdigest()
 
 
-def _objects_dir(batch_dir: Path) -> Path:
-    return batch_dir / "objects"
-
-
-# ---------------------------------------------------------
-# Manifest
-# ---------------------------------------------------------
-
-def check_manifest(batch_dir: Path) -> InspectionResult:
-    errors = []
-
-    manifest_path = batch_dir / "source.json"
-
-    if not manifest_path.is_file():
-        return InspectionResult(
-            passed=False,
-            errors=["source.json is missing"],
-        )
-
-    try:
-        manifest = json.loads(
-            manifest_path.read_text(encoding="utf-8")
-        )
-    except (json.JSONDecodeError, OSError) as error:
-        return InspectionResult(
-            passed=False,
-            errors=[
-                f"source.json cannot be read: {error}"
-            ],
-        )
-
+def read_manifest(batch_dir, policy):
+    with open_regular(batch_dir / 'source.json') as stream:
+        if os.fstat(stream.fileno()).st_size > policy['max_manifest_bytes']:
+            raise ValueError('source.json exceeds manifest size limit')
+        data = stream.read(policy['max_manifest_bytes'] + 1)
+        if len(data) > policy['max_manifest_bytes']:
+            raise ValueError('source.json exceeds manifest size limit')
+    actual_hash = hashlib.sha256(data).hexdigest()
+    with open_regular(batch_dir / 'source.json.sha256') as stream:
+        expected_hash = stream.read(1024).decode('ascii').strip()
+    if expected_hash != actual_hash:
+        raise ValueError('source.json.sha256 mismatch')
+    manifest = json.loads(data)
     if not isinstance(manifest, dict):
-        return InspectionResult(
-            passed=False,
-            errors=[
-                "source.json must contain a JSON object"
-            ],
-        )
-
-    required_fields = {
-        "schema_version",
-        "record_type",
-        "batch_id",
-        "source",
-        "license",
-        "artifacts",
-    }
-
-    for field in required_fields:
-        if field not in manifest:
-            errors.append(
-                f"source.json missing required field: {field}"
-            )
-
-    if manifest.get("batch_id") != batch_dir.name:
-        errors.append(
-            "source.json batch_id does not match directory name"
-        )
-
-    artifacts = manifest.get("artifacts")
-
-    if not isinstance(artifacts, list):
-        errors.append(
-            "artifacts must be a list"
-        )
-
-    elif not artifacts:
-        errors.append(
-            "artifacts list is empty"
-        )
-
-    return InspectionResult(
-        passed=len(errors) == 0,
-        errors=errors,
-    )
+        raise ValueError('source.json must contain a JSON object')
+    if manifest.get('batch_id') != batch_dir.name:
+        raise ValueError('source.json batch_id does not match directory name')
+    if manifest.get('schema_version') != '1.0.0' or manifest.get('record_type') != 'incoming_source_batch':
+        raise ValueError('unsupported source manifest schema or record_type')
+    if not isinstance(manifest.get('source'), dict) or not isinstance(manifest.get('license'), dict):
+        raise ValueError('source and license must be objects')
+    artifacts = manifest.get('artifacts')
+    if not isinstance(artifacts, list) or not artifacts:
+        raise ValueError('artifacts must be a nonempty list')
+    ids, paths = set(), set()
+    for item in artifacts:
+        if not isinstance(item, dict):
+            raise ValueError('each artifact must be an object')
+        for key in ('artifact_id', 'original_filename', 'stored_relative_path', 'sha256'):
+            if not isinstance(item.get(key), str) or not item[key]:
+                raise ValueError(f'artifact {key} must be a nonempty string')
+        if not re.fullmatch(r'[a-f0-9]{64}', item['sha256']):
+            raise ValueError('artifact sha256 must contain 64 lowercase hex characters')
+        if type(item.get('size_bytes')) is not int or item['size_bytes'] < 0:
+            raise ValueError('artifact size_bytes must be a nonnegative integer')
+        if item['artifact_id'] in ids or item['stored_relative_path'] in paths:
+            raise ValueError('duplicate artifact ID or stored path in manifest')
+        ids.add(item['artifact_id'])
+        paths.add(item['stored_relative_path'])
+    return manifest, actual_hash
 
 
-# ---------------------------------------------------------
-# Integrity
-# ---------------------------------------------------------
+def detect_encoding(prefix):
+    if prefix.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+        raise UnicodeError('UTF-32 is not supported')
+    if prefix.startswith(codecs.BOM_UTF8):
+        return 'utf-8-sig'
+    if prefix.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return 'utf-16'
+    return 'utf-8'
 
-def check_integrity(batch_dir: Path) -> InspectionResult:
-    errors = []
 
-    manifest_path = batch_dir / "source.json"
-    checksum_path = batch_dir / "source.json.sha256"
-
-    if not manifest_path.is_file():
-        errors.append(
-            "source.json is missing"
-        )
-
-    if not checksum_path.is_file():
-        errors.append(
-            "source.json.sha256 is missing"
-        )
-
-    if errors:
-        return InspectionResult(
-            passed=False,
-            errors=errors,
-        )
-
+def _detect_mime(stream, policy):
+    stream.seek(0)
+    prefix = stream.read(8192)
+    if prefix.startswith(b'MZ'):
+        return 'application/x-dosexec', 'builtin-signature'
+    if prefix.startswith(b'\x7fELF'):
+        return 'application/x-elf', 'builtin-signature'
+    if prefix[:4] in (b'\xfe\xed\xfa\xce', b'\xce\xfa\xed\xfe', b'\xfe\xed\xfa\xcf', b'\xcf\xfa\xed\xfe', b'\xca\xfe\xba\xbe'):
+        return 'application/x-mach-binary', 'builtin-signature'
+    if prefix.startswith(b'#!'):
+        return 'text/x-shellscript', 'builtin-signature'
+    if prefix.startswith(b'%PDF-'):
+        return 'application/pdf', 'builtin-signature'
+    if prefix.lower().startswith(b'{\\rtf'):
+        return 'application/rtf', 'builtin-signature'
+    if prefix.startswith(b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1'):
+        return 'application/x-ole-storage', 'builtin-signature'
+    if prefix.startswith(b'PK'):
+        with bounded_zip(stream, policy) as archive:
+            names = archive.namelist()
+            for required, mime in ZIP_FORMATS.values():
+                if required in names:
+                    if required == 'content.xml':
+                        if 'mimetype' in names and archive.getinfo('mimetype').file_size < 256:
+                            return archive.read('mimetype').decode('ascii'), 'builtin-container'
+                        return 'application/zip', 'builtin-container'
+                    return mime, 'builtin-container'
+        return 'application/zip', 'builtin-container'
     try:
-        expected_manifest_hash = checksum_path.read_text(
-            encoding="utf-8"
-        ).strip()
-
-        actual_manifest_hash = _sha256_file(
-            manifest_path
-        )
-
-        if expected_manifest_hash != actual_manifest_hash:
-            errors.append(
-                "source.json.sha256 mismatch"
-            )
-
-        manifest = json.loads(
-            manifest_path.read_text(
-                encoding="utf-8"
-            )
-        )
-
-    except (OSError, json.JSONDecodeError) as error:
-        return InspectionResult(
-            passed=False,
-            errors=[
-                f"cannot verify source.json: {error}"
-            ],
-        )
-
-    for artifact in manifest.get("artifacts", []):
-        artifact_id = artifact.get(
-            "artifact_id",
-            "unknown",
-        )
-
-        relative_path = artifact.get(
-            "stored_relative_path"
-        )
-
-        expected_hash = artifact.get(
-            "sha256"
-        )
-
-        if not relative_path:
-            errors.append(
-                f"{artifact_id}: stored_relative_path is missing"
-            )
-            continue
-
-        if not expected_hash:
-            errors.append(
-                f"{artifact_id}: sha256 is missing"
-            )
-            continue
-
-        artifact_path = batch_dir / relative_path
-
-        if not artifact_path.is_file():
-            errors.append(
-                f"{artifact_id}: file is missing"
-            )
-            continue
-
-        actual_hash = _sha256_file(
-            artifact_path
-        )
-
-        if actual_hash != expected_hash:
-            errors.append(
-                f"{artifact_id}: sha256 mismatch"
-            )
-
-    return InspectionResult(
-        passed=len(errors) == 0,
-        errors=errors,
-    )
-
-
-# ---------------------------------------------------------
-# Limits
-# ---------------------------------------------------------
-
-def check_limits(batch_dir: Path) -> InspectionResult:
-    errors = []
-
-    config = load_inspection_config()
-
-    max_file_size = config["max_file_size_bytes"]
-    max_batch_size = config["max_batch_size_bytes"]
-    max_files_per_batch = config["max_files_per_batch"]
-
-    objects_dir = _objects_dir(batch_dir)
-
-    if not objects_dir.is_dir():
-        return InspectionResult(
-            passed=False,
-            errors=[
-                "objects directory is missing"
-            ],
-        )
-
-    files = [
-        path
-        for path in objects_dir.iterdir()
-        if path.is_file()
-    ]
-
-    if len(files) > max_files_per_batch:
-        errors.append(
-            f"batch contains too many files: {len(files)}"
-        )
-
-    total_size = 0
-
-    for file_path in files:
+        text = codecs.getincrementaldecoder(detect_encoding(prefix))().decode(prefix, final=False)
+        if any(ord(c) < 32 and c not in '\t\r\n\f' for c in text):
+            raise UnicodeError('binary control bytes')
+        stripped = text.lstrip().lower()
+        if stripped.startswith(('<!doctype html', '<html', '<head', '<body')):
+            return 'text/html', 'builtin-text'
+        if stripped.startswith('<'):
+            return 'application/xml', 'builtin-text'
+        return 'text/plain', 'builtin-text'
+    except UnicodeError:
+        # Optional libmagic only supplements unknown binary signatures.
         try:
-            size = file_path.stat().st_size
-        except OSError as error:
-            errors.append(
-                f"{file_path.name}: cannot read file size: {error}"
-            )
-            continue
-
-        total_size += size
-
-        if size == 0:
-            errors.append(
-                f"{file_path.name}: empty file"
-            )
-
-        if size > max_file_size:
-            errors.append(
-                f"{file_path.name}: file exceeds size limit"
-            )
-
-    if total_size > max_batch_size:
-        errors.append(
-            f"batch exceeds total size limit: "
-            f"{total_size} bytes"
-        )
-
-    return InspectionResult(
-        passed=len(errors) == 0,
-        errors=errors,
-    )
-
-
-# ---------------------------------------------------------
-# File Type
-# ---------------------------------------------------------
-
-def check_file_type(batch_dir: Path) -> InspectionResult:
-    errors = []
-
-    config = load_inspection_config()
-
-    known_file_types = config[
-        "known_file_types"
-    ]
-
-    allowed_extensions = {
-        extension.lower()
-        for extension in config[
-            "allowed_extensions"
-        ]
-    }
-
-    unknown_policy = config.get(
-        "unknown_file_policy",
-        "quarantine",
-    )
-
-    objects_dir = _objects_dir(batch_dir)
-
-    if not objects_dir.is_dir():
-        return InspectionResult(
-            passed=False,
-            errors=[
-                "objects directory is missing"
-            ],
-        )
-
-    for file_path in objects_dir.iterdir():
-        if not file_path.is_file():
-            continue
-
-        suffix = file_path.suffix.lower()
-
-        if suffix not in allowed_extensions:
-            if unknown_policy == "quarantine":
-                errors.append(
-                    f"{file_path.name}: "
-                    f"unsupported or unknown file extension"
-                )
-
-            continue
-
-        file_type = known_file_types.get(
-            suffix
-        )
-
-        if file_type is None:
-            continue
-
-        expected_signature = SIGNATURES.get(
-            file_type
-        )
-
-        if expected_signature is None:
-            continue
-
-        try:
-            with file_path.open("rb") as file:
-                actual_signature = file.read(
-                    len(expected_signature)
-                )
-
-        except OSError as error:
-            errors.append(
-                f"{file_path.name}: "
-                f"cannot read file signature: {error}"
-            )
-            continue
-
-        if actual_signature != expected_signature:
-            errors.append(
-                f"{file_path.name}: "
-                f"content does not match expected "
-                f"{file_type} type"
-            )
-
-    return InspectionResult(
-        passed=len(errors) == 0,
-        errors=errors,
-    )
-
-
-# ---------------------------------------------------------
-# Security
-# ---------------------------------------------------------
-
-def check_security(batch_dir: Path) -> InspectionResult:
-    errors = []
-
-    config = load_inspection_config()
-
-    blocked_extensions = {
-        extension.lower()
-        for extension in config[
-            "blocked_extensions"
-        ]
-    }
-
-    objects_dir = _objects_dir(batch_dir)
-
-    if not objects_dir.is_dir():
-        return InspectionResult(
-            passed=False,
-            errors=[
-                "objects directory is missing"
-            ],
-        )
-
-    for file_path in objects_dir.iterdir():
-        if not file_path.is_file():
-            continue
-
-        suffix = file_path.suffix.lower()
-
-        if suffix in blocked_extensions:
-            errors.append(
-                f"{file_path.name}: "
-                f"blocked executable/script type"
-            )
-
-    return InspectionResult(
-        passed=len(errors) == 0,
-        errors=errors,
-    )
-
-
-# ---------------------------------------------------------
-# Archive
-# ---------------------------------------------------------
-
-def check_archives(batch_dir: Path) -> InspectionResult:
-    errors = []
-
-    config = load_inspection_config()
-
-    max_archive_files = config[
-        "max_archive_files"
-    ]
-
-    max_uncompressed_bytes = config[
-        "max_uncompressed_bytes"
-    ]
-
-    max_compression_ratio = config[
-        "max_compression_ratio"
-    ]
-
-    objects_dir = _objects_dir(batch_dir)
-
-    if not objects_dir.is_dir():
-        return InspectionResult(
-            passed=False,
-            errors=[
-                "objects directory is missing"
-            ],
-        )
-
-    for file_path in objects_dir.iterdir():
-        if not file_path.is_file():
-            continue
-
-        suffix = file_path.suffix.lower()
-
-        if suffix not in {
-            ".zip",
-            ".docx",
-        }:
-            continue
-
-        try:
-            with zipfile.ZipFile(
-                file_path,
-                "r",
-            ) as archive:
-
-                entries = archive.infolist()
-
-                if len(entries) > max_archive_files:
-                    errors.append(
-                        f"{file_path.name}: "
-                        f"too many archive entries"
-                    )
-
-                total_uncompressed = sum(
-                    entry.file_size
-                    for entry in entries
-                )
-
-                total_compressed = sum(
-                    entry.compress_size
-                    for entry in entries
-                )
-
-                if (
-                    total_uncompressed
-                    > max_uncompressed_bytes
-                ):
-                    errors.append(
-                        f"{file_path.name}: "
-                        f"uncompressed size exceeds limit"
-                    )
-
-                if total_compressed > 0:
-                    ratio = (
-                        total_uncompressed
-                        / total_compressed
-                    )
-
-                    if ratio > max_compression_ratio:
-                        errors.append(
-                            f"{file_path.name}: "
-                            f"suspicious compression ratio"
-                        )
-
-                for entry in entries:
-                    parts = Path(
-                        entry.filename
-                    ).parts
-
-                    if ".." in parts:
-                        errors.append(
-                            f"{file_path.name}: "
-                            f"unsafe archive path"
-                        )
-                        break
-
-        except zipfile.BadZipFile:
-            errors.append(
-                f"{file_path.name}: "
-                f"invalid ZIP container"
-            )
-
-        except OSError as error:
-            errors.append(
-                f"{file_path.name}: "
-                f"cannot inspect archive: {error}"
-            )
-
-    return InspectionResult(
-        passed=len(errors) == 0,
-        errors=errors,
-    )
-
-
-# ---------------------------------------------------------
-# Malware
-# ---------------------------------------------------------
-
-def check_malware(batch_dir: Path) -> InspectionResult:
-    """
-    Placeholder.
-
-    Later this will call a real malware scanner
-    such as ClamAV or an external sandbox.
-    """
-
-    return InspectionResult(
-        passed=True,
-        errors=[],
-    )
-
-
-# ---------------------------------------------------------
-# Readability
-# ---------------------------------------------------------
-
-def check_readability(batch_dir: Path) -> InspectionResult:
-    errors = []
-
-    objects_dir = _objects_dir(batch_dir)
-
-    if not objects_dir.is_dir():
-        return InspectionResult(
-            passed=False,
-            errors=[
-                "objects directory is missing"
-            ],
-        )
-
-    for file_path in objects_dir.iterdir():
-        if not file_path.is_file():
-            continue
-
-        suffix = file_path.suffix.lower()
-
-        try:
+            import magic
+            return magic.from_buffer(prefix, mime=True).lower(), 'libmagic'
+        except (ImportError, AttributeError, OSError, RuntimeError):
+            return None, 'unavailable'
+
+
+def detect_mime_type(path, policy):
+    with open_regular(path) as stream:
+        return _detect_mime(stream, policy)[0]
+
+
+def inspect_text(stream, encoding, policy):
+    stream.seek(0)
+    decoder = codecs.getincrementaldecoder(encoding)(errors='strict')
+    characters = lines = longest = current = 0
+    previous_cr = False
+    while True:
+        chunk = stream.read(CHUNK)
+        text = decoder.decode(chunk, final=not chunk)
+        characters += len(text)
+        if any(ord(c) < 32 and c not in '\t\r\n\f' for c in text):
+            raise ValueError('binary control characters in text')
+        if previous_cr and text.startswith('\n'):
+            text = text[1:]
+        if text:
+            previous_cr = text.endswith('\r')
+            parts = re.split(r'\r\n|\r|\n', text)
+            current += len(parts[0])
+            longest = max(longest, current)
+            if len(parts) > 1:
+                lines += len(parts) - 1
+                longest = max(longest, *(len(part) for part in parts[1:]))
+                current = len(parts[-1])
+        if not chunk:
+            break
+    return characters, lines + bool(current), longest
+
+
+def _inspect_json(stream, suffix, encoding, size, policy):
+    stream.seek(0)
+    wrapper = io.TextIOWrapper(stream, encoding=encoding, errors='strict')
+    def invalid_constant(value):
+        raise ValueError(f'nonstandard JSON constant: {value}')
+    try:
+        if suffix == '.json':
+            if size > policy['max_structured_bytes']:
+                raise ValueError('JSON exceeds bounded structural validation limit')
+            json.loads(wrapper.read(policy['max_structured_bytes'] + 1), parse_constant=invalid_constant)
+        else:
+            for line in wrapper:
+                if line.strip():
+                    json.loads(line, parse_constant=invalid_constant)
+    finally:
+        wrapper.detach()
+
+
+def add_check(result, check, **evidence):
+    return replace(result, decision=more_restrictive_decision(result.decision, check.decision),
+                   checks=result.checks + (check,), **evidence)
+
+
+def inspect_artifact(batch_dir, artifact, policy, remaining_bytes, within_count=True):
+    result = ArtifactInspectionResult(artifact['artifact_id'], artifact['original_filename'], artifact['stored_relative_path'])
+    try:
+        path = safe_artifact_path(batch_dir, artifact['stored_relative_path'])
+        for component in (*reversed(path.absolute().parents), path):
+            metadata = component.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or getattr(metadata, 'st_file_attributes', 0) & 0x400:
+                return add_check(result, CheckResult('filesystem', D.REJECTED, ('symlink/reparse point in artifact path',)), is_symlink=True)
+        info = path.lstat()
+        result = replace(result, size_bytes=info.st_size, is_symlink=stat.S_ISLNK(info.st_mode),
+                         is_regular_file=stat.S_ISREG(info.st_mode))
+        if result.is_symlink or not result.is_regular_file:
+            return add_check(result, CheckResult('filesystem', D.REJECTED, ('symlink or non-regular file',)))
+        if not within_count or info.st_size > policy['max_file_size_bytes'] or info.st_size > remaining_bytes:
+            return add_check(result, CheckResult('limits', D.REJECTED, ('file or remaining batch resource limit exceeded',)))
+        suffix = Path(result.filename).suffix.lower()
+        stored_suffix = path.suffix.lower()
+        if suffix in policy['blocked_extensions'] or stored_suffix in policy['blocked_extensions']:
+            return add_check(result, CheckResult('extension', D.REJECTED, ('blocked extension',)))
+        if suffix != stored_suffix:
+            result = add_check(result, CheckResult('extension', D.QUARANTINED, ('stored/original extension mismatch',)))
+        if suffix not in policy['allowed_extensions']:
+            decision = D.REJECTED if policy['unknown_file_policy'] == 'reject' else D.QUARANTINED
+            result = add_check(result, CheckResult('extension', decision, ('unsupported extension',)))
+        elif suffix not in TEXT_EXTENSIONS | DEEP_EXTENSIONS:
+            result = add_check(result, CheckResult('extension', D.QUARANTINED, ('inspection handler unavailable',)))
+        with open_regular(path) as source, tempfile.TemporaryFile() as stream:
+            before = os.fstat(source.fileno())
+            if (before.st_size, before.st_dev, before.st_ino) != (info.st_size, info.st_dev, info.st_ino):
+                raise OSError('artifact changed while opening')
+            result = add_check(result, CheckResult('filesystem'))
+            if not info.st_size:
+                return add_check(result, CheckResult('limits', D.QUARANTINED, ('empty file',)))
+            # All content checks share the exact private snapshot that was hashed.
+            result = replace(result, sha256=stream_hash(source, info.st_size, stream))
+            integrity = ()
+            if result.sha256 != artifact['sha256']:
+                integrity += ('artifact sha256 mismatch',)
+            if info.st_size != artifact['size_bytes']:
+                integrity += ('artifact size mismatch',)
+            result = add_check(result, CheckResult('integrity', D.QUARANTINED if integrity else D.ACCEPTED, integrity))
+            mime, method = _detect_mime(stream, policy)
+            result = replace(result, detected_mime_type=mime, mime_detection_method=method)
+            if mime in policy['blocked_mime_types']:
+                return add_check(result, CheckResult('mime', D.REJECTED, ('blocked executable MIME type',)))
+            mismatch = mime not in policy['expected_mime_types'].get(suffix, ())
+            result = add_check(result, CheckResult('mime', D.QUARANTINED if mismatch else D.ACCEPTED,
+                               ('content MIME unavailable or inconsistent with extension',) if mismatch else ()))
             if suffix in TEXT_EXTENSIONS:
-                with file_path.open(
-                    "r",
-                    encoding="utf-8",
-                    errors="strict",
-                ) as file:
-                    file.read(4096)
+                stream.seek(0)
+                encoding = detect_encoding(stream.read(4))
+                result = replace(result, encoding=encoding)
+                chars, lines, longest = inspect_text(stream, encoding, policy)
+                result = replace(result, character_count=chars, line_count=lines, max_line_characters=longest)
+                extreme = longest > policy['max_line_characters']
+                result = add_check(result, CheckResult('text', D.QUARANTINED if extreme else D.ACCEPTED,
+                                   ('maximum line length exceeded',) if extreme else ()))
+                if suffix in {'.json', '.jsonl', '.ndjson'} and not extreme:
+                    _inspect_json(stream, suffix, encoding, info.st_size, policy)
+                    result = add_check(result, CheckResult('json_structure'))
+            if suffix in DEEP_EXTENSIONS:
+                check, flags = inspect_deep_container(stream, suffix, policy, result.encoding)
+                result = add_check(result, check, flags=result.flags + flags)
+            after = os.fstat(source.fileno())
+            if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                raise OSError('artifact changed during inspection')
+        return result
+    except UnsafeContent as error:
+        return add_check(result, CheckResult('content', D.REJECTED, (str(error),)))
+    except OSError as error:
+        decision = D.REJECTED if error.errno in (errno.ELOOP, errno.ENOTDIR) else D.QUARANTINED
+        return add_check(result, CheckResult('filesystem', decision, (str(error),)))
+    except (ValueError, UnicodeError, RecursionError, RuntimeError, zipfile.BadZipFile, zlib.error) as error:
+        return add_check(result, CheckResult('content_or_filesystem', D.QUARANTINED, (str(error),)))
 
-            else:
-                with file_path.open(
-                    "rb"
-                ) as file:
-                    file.read(4096)
 
-        except (
-            OSError,
-            UnicodeError,
-        ) as error:
-            errors.append(
-                f"{file_path.name}: "
-                f"unreadable file: {error}"
-            )
-
-    return InspectionResult(
-        passed=len(errors) == 0,
-        errors=errors,
-    )
-
-
-# ---------------------------------------------------------
-# Text Content
-# ---------------------------------------------------------
-
-def check_text_content(
-    batch_dir: Path,
-) -> InspectionResult:
-    errors = []
-
-    objects_dir = _objects_dir(batch_dir)
-
-    if not objects_dir.is_dir():
-        return InspectionResult(
-            passed=False,
-            errors=[
-                "objects directory is missing"
-            ],
-        )
-
-    for file_path in objects_dir.iterdir():
-        if not file_path.is_file():
-            continue
-
-        if (
-            file_path.suffix.lower()
-            not in TEXT_EXTENSIONS
-        ):
-            continue
-
+def _scan_snapshots(paths, policy):
+    engines = [engine for name in ('clamdscan', 'clamscan') if (engine := shutil.which(name))]
+    if not engines:
+        return {path: MalwareScanResult(M.UNAVAILABLE, error='clamdscan and clamscan unavailable') for path in paths}
+    results = {}
+    for engine in engines:
+        pending = [path for path in paths if path not in results or results[path].status == M.ERROR]
+        if not pending:
+            break
         try:
-            with file_path.open(
-                "r",
-                encoding="utf-8",
-                errors="strict",
-            ) as file:
-                sample = file.read(8192)
-
-        except UnicodeDecodeError:
-            errors.append(
-                f"{file_path.name}: "
-                f"invalid UTF-8 text"
-            )
-            continue
-
-        except OSError as error:
-            errors.append(
-                f"{file_path.name}: "
-                f"cannot read text: {error}"
-            )
-            continue
-
-        if "\x00" in sample:
-            errors.append(
-                f"{file_path.name}: "
-                f"contains null bytes and "
-                f"may not be plain text"
-            )
-
-    return InspectionResult(
-        passed=len(errors) == 0,
-        errors=errors,
-    )
+            proc = subprocess.run([engine, '--no-summary', '--', *map(str, pending)], capture_output=True,
+                                  text=True, errors='replace', timeout=policy['malware_timeout_seconds'], check=False)
+            output = (proc.stdout + '\n' + proc.stderr).splitlines()
+            for path in pending:
+                verdicts = [line[len(str(path)) + 2:] for line in output if line.startswith(str(path) + ': ')]
+                infected = [v[:-6] for v in verdicts if v.endswith(' FOUND')]
+                if infected:
+                    results[path] = MalwareScanResult(M.INFECTED, engine, infected[0])
+                elif proc.returncode in (0, 1) and verdicts == ['OK']:
+                    results[path] = MalwareScanResult(M.CLEAN, engine)
+                else:
+                    error = '; '.join(verdicts) or (proc.stderr.strip()[:500] or 'no per-file verdict')
+                    results[path] = MalwareScanResult(M.ERROR, engine, error=f'exit {proc.returncode}: {error}')
+        except (OSError, subprocess.TimeoutExpired) as error:
+            for path in pending:
+                results[path] = MalwareScanResult(M.ERROR, engine, error=str(error))
+    return results
 
 
-# ---------------------------------------------------------
-# Structured Content
-# ---------------------------------------------------------
+def scan_malware_batch(batch_dir, artifacts, policy):
+    """Stage bounded, hash-verified snapshots so scanners cannot follow source links."""
+    results = {}
+    candidates = [a for a in artifacts if a.sha256 and a.decision != D.REJECTED]
+    def chunks():
+        chunk, size = [], 0
+        for artifact in candidates:
+            if chunk and (len(chunk) >= policy['malware_chunk_size']
+                          or size + artifact.size_bytes > policy['max_malware_chunk_bytes']):
+                yield chunk
+                chunk, size = [], 0
+            chunk.append(artifact)
+            size += artifact.size_bytes
+        if chunk:
+            yield chunk
 
-def check_structured_content(
-    batch_dir: Path,
-) -> InspectionResult:
-    errors = []
-
-    objects_dir = _objects_dir(batch_dir)
-
-    if not objects_dir.is_dir():
-        return InspectionResult(
-            passed=False,
-            errors=[
-                "objects directory is missing"
-            ],
-        )
-
-    for file_path in objects_dir.iterdir():
-        if not file_path.is_file():
-            continue
-
-        suffix = file_path.suffix.lower()
-
-        try:
-            if suffix == ".json":
-                with file_path.open(
-                    "r",
-                    encoding="utf-8",
-                ) as file:
-                    json.load(file)
-
-            elif suffix == ".xml":
-                ET.parse(file_path)
-
-        except json.JSONDecodeError as error:
-            errors.append(
-                f"{file_path.name}: "
-                f"invalid JSON: {error}"
-            )
-
-        except ET.ParseError as error:
-            errors.append(
-                f"{file_path.name}: "
-                f"invalid XML: {error}"
-            )
-
-        except OSError as error:
-            errors.append(
-                f"{file_path.name}: "
-                f"cannot read file: {error}"
-            )
-
-    return InspectionResult(
-        passed=len(errors) == 0,
-        errors=errors,
-    )
+    for chunk in chunks():
+        with tempfile.TemporaryDirectory(prefix='jsm-malware-') as directory:
+            targets = {}
+            for index, artifact in enumerate(chunk):
+                snapshot = Path(directory).resolve() / f'{index:06d}{Path(artifact.filename).suffix.lower()}'
+                try:
+                    path = safe_artifact_path(batch_dir, artifact.stored_relative_path)
+                    with open_regular(path) as source, snapshot.open('xb') as output:
+                        digest = hashlib.sha256()
+                        size = 0
+                        while data := source.read(CHUNK):
+                            size += len(data)
+                            if size > artifact.size_bytes:
+                                raise OSError('artifact changed before malware scan')
+                            output.write(data)
+                            digest.update(data)
+                    if digest.hexdigest() != artifact.sha256:
+                        raise OSError('artifact changed before malware scan')
+                    targets[snapshot] = artifact.artifact_id
+                except (OSError, ValueError) as error:
+                    results[artifact.artifact_id] = MalwareScanResult(M.ERROR, error=str(error))
+            for path, verdict in _scan_snapshots(list(targets), policy).items():
+                results[targets[path]] = verdict
+    return results
 
 
-def inspect_artifact(
-    file_path: Path,
-    artifact: dict,
-) -> ArtifactInspectionResult:
-
-    artifact_id = artifact.get(
-        "artifact_id",
-        "unknown",
-    )
-
-    filename = artifact.get(
-        "original_filename",
-        file_path.name,
-    )
-
-    checks = []
-    errors = []
-
-    config = load_inspection_config()
-
-    suffix = file_path.suffix.lower()
-
-    # -------------------------------------------------
-    # Exists
-    # -------------------------------------------------
-
-    exists_errors = []
-
-    if not file_path.is_file():
-        exists_errors.append("file is missing")
-
-    checks.append(
-        CheckResult(
-            name="exists",
-            passed=len(exists_errors) == 0,
-            errors=exists_errors,
-        )
-    )
-
-    errors.extend(exists_errors)
-
-    if exists_errors:
-        return ArtifactInspectionResult(
-            artifact_id=artifact_id,
-            filename=filename,
-            passed=False,
-            checks=checks,
-            errors=errors,
-        )
-
-    # -------------------------------------------------
-    # Size
-    # -------------------------------------------------
-
-    size_errors = []
-
-    size = file_path.stat().st_size
-
-    if size == 0:
-        size_errors.append("empty file")
-
-    if size > config["max_file_size_bytes"]:
-        size_errors.append("file exceeds size limit")
-
-    checks.append(
-        CheckResult(
-            name="limits",
-            passed=len(size_errors) == 0,
-            errors=size_errors,
-        )
-    )
-
-    errors.extend(size_errors)
-
-    # -------------------------------------------------
-    # Extension / File Type
-    # -------------------------------------------------
-
-    type_errors = []
-
-    allowed_extensions = {
-        ext.lower()
-        for ext in config["allowed_extensions"]
-    }
-
-    blocked_extensions = {
-        ext.lower()
-        for ext in config["blocked_extensions"]
-    }
-
-    if suffix in blocked_extensions:
-        type_errors.append(
-            "blocked executable/script type"
-        )
-
-    elif suffix not in allowed_extensions:
-        type_errors.append(
-            "unsupported or unknown file extension"
-        )
-
-    file_type = config["known_file_types"].get(suffix)
-
-    if file_type:
-        expected_signature = SIGNATURES.get(file_type)
-
-        if expected_signature:
-            with file_path.open("rb") as file:
-                actual_signature = file.read(
-                    len(expected_signature)
-                )
-
-            if actual_signature != expected_signature:
-                type_errors.append(
-                    f"content does not match expected "
-                    f"{file_type} type"
-                )
-
-    checks.append(
-        CheckResult(
-            name="file_type",
-            passed=len(type_errors) == 0,
-            errors=type_errors,
-        )
-    )
-
-    errors.extend(type_errors)
-
-    # -------------------------------------------------
-    # Readability / Text
-    # -------------------------------------------------
-
-    readability_errors = []
-
-    if suffix in TEXT_EXTENSIONS:
-        try:
-            with file_path.open(
-                "r",
-                encoding="utf-8",
-                errors="strict",
-            ) as file:
-                sample = file.read(8192)
-
-            if "\x00" in sample:
-                readability_errors.append(
-                    "contains null bytes"
-                )
-
-        except UnicodeDecodeError:
-            readability_errors.append(
-                "invalid UTF-8 text"
-            )
-
-        except OSError as error:
-            readability_errors.append(
-                f"cannot read file: {error}"
-            )
-
-    else:
-        try:
-            with file_path.open("rb") as file:
-                file.read(4096)
-
-        except OSError as error:
-            readability_errors.append(
-                f"cannot read file: {error}"
-            )
-
-    checks.append(
-        CheckResult(
-            name="readability",
-            passed=len(readability_errors) == 0,
-            errors=readability_errors,
-        )
-    )
-
-    errors.extend(readability_errors)
-
-    return ArtifactInspectionResult(
-        artifact_id=artifact_id,
-        filename=filename,
-        passed=len(errors) == 0,
-        checks=checks,
-        errors=errors,
-    )
+def apply_malware_result(artifact, malware, policy):
+    decision = D.ACCEPTED
+    if malware.status == M.INFECTED:
+        decision = D.REJECTED
+    elif malware.status != M.CLEAN and policy['require_malware_scan']:
+        decision = D.QUARANTINED
+    errors = (malware.error or malware.signature or malware.status.value,) if decision != D.ACCEPTED else ()
+    return add_check(artifact, CheckResult('malware', decision, errors),
+                     malware_scan_status=malware.status, malware_engine=malware.engine,
+                     malware_signature=malware.signature, malware_error=malware.error)

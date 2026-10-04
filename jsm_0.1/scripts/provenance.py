@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 from paths import (
     BATCHES_DIR,
@@ -21,8 +20,6 @@ def load_inspection_manifests() -> list[dict]:
             manifest_path.read_text(encoding="utf-8")
         )
 
-        manifest["_manifest_path"] = str(manifest_path)
-
         manifests.append(manifest)
 
     return manifests
@@ -37,7 +34,6 @@ def get_batch_id(inspection: dict) -> str | None:
         if batch_id:
             return batch_id
 
-    # Fallback if current inspector stores it directly
     return inspection.get("batch_id")
 
 
@@ -50,18 +46,14 @@ if __name__ == "__main__":
         batch_id = get_batch_id(inspection)
 
         if not batch_id:
-            print(
-                "SKIP: inspection manifest has no incoming batch_id"
-            )
+            print("SKIP: inspection has no batch_id")
             continue
 
         batch_dir = BATCHES_DIR / batch_id
         source_path = batch_dir / "source.json"
 
         if not source_path.is_file():
-            print(
-                f"SKIP: {batch_id} — source.json missing"
-            )
+            print(f"SKIP: {batch_id} — source.json missing")
             continue
 
         source_manifest = json.loads(

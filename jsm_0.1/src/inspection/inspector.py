@@ -1,133 +1,34 @@
-import json
+"""Batch trust gate and artifact-level orchestration."""
+from copy import deepcopy
 from pathlib import Path
 
 from src.inspection.checks import (
-    check_manifest,
-    check_integrity,
-    inspect_artifact,
+    apply_malware_result, inspect_artifact, read_manifest, scan_malware_batch,
 )
-from src.inspection.result import (
-    CheckResult,
-    ArtifactInspectionResult,
-    InspectionResult,
-)
+from src.inspection.config import load_inspection_config, validate_inspection_config
+from src.inspection.result import CheckResult, InspectionDecision as D, InspectionResult
 
 
-def inspect_batch(batch_dir: Path) -> InspectionResult:
-    batch_checks = []
-    batch_errors = []
-
-    # -------------------------------------------------
-    # Batch-level checks
-    # -------------------------------------------------
-
-    batch_check_functions = [
-        ("manifest", check_manifest),
-        ("integrity", check_integrity),
-    ]
-
-    for name, check_function in batch_check_functions:
-        result = check_function(batch_dir)
-
-        batch_checks.append(
-            CheckResult(
-                name=name,
-                passed=result.passed,
-                errors=result.errors,
-            )
-        )
-
-        batch_errors.extend(result.errors)
-
-    # -------------------------------------------------
-    # Load manifest
-    # -------------------------------------------------
-
-    manifest_path = batch_dir / "source.json"
-
+def inspect_batch(batch_dir: Path, policy: dict | None = None) -> InspectionResult:
+    policy = deepcopy(load_inspection_config() if policy is None else validate_inspection_config(policy))
+    batch_dir = Path(batch_dir).absolute()
     try:
-        manifest = json.loads(
-            manifest_path.read_text(
-                encoding="utf-8"
-            )
-        )
-
-    except (OSError, json.JSONDecodeError):
-        return InspectionResult(
-            passed=False,
-            checks=batch_checks,
-            artifacts=[],
-            errors=batch_errors,
-        )
-
-    # -------------------------------------------------
-    # Artifact-level inspection
-    # -------------------------------------------------
-
-    artifact_results: list[ArtifactInspectionResult] = []
-
-    for artifact in manifest.get("artifacts", []):
-        artifact_id = artifact.get(
-            "artifact_id",
-            "unknown",
-        )
-
-        filename = artifact.get(
-            "original_filename",
-            "unknown",
-        )
-
-        relative_path = artifact.get(
-            "stored_relative_path"
-        )
-
-        # Cannot inspect without storage path
-        if not relative_path:
-            artifact_results.append(
-                ArtifactInspectionResult(
-                    artifact_id=artifact_id,
-                    filename=filename,
-                    passed=False,
-                    checks=[],
-                    errors=[
-                        "stored_relative_path is missing"
-                    ],
-                )
-            )
-            continue
-
-        file_path = batch_dir / relative_path
-
-        artifact_result = inspect_artifact(
-            file_path=file_path,
-            artifact=artifact,
-        )
-
-        artifact_results.append(
-            artifact_result
-        )
-
-    # -------------------------------------------------
-    # Final batch result
-    # -------------------------------------------------
-
-    batch_structure_passed = (
-        len(batch_errors) == 0
-    )
-
-    artifacts_passed = all(
-        artifact.passed
-        for artifact in artifact_results
-    )
-
-    passed = (
-        batch_structure_passed
-        and artifacts_passed
-    )
-
-    return InspectionResult(
-        passed=passed,
-        checks=batch_checks,
-        artifacts=artifact_results,
-        errors=batch_errors,
-    )
+        manifest, digest = read_manifest(batch_dir, policy)
+    except (OSError, ValueError, UnicodeError, RecursionError) as error:
+        return InspectionResult(batch_dir.name, None, policy,
+                                checks=(CheckResult('manifest', D.QUARANTINED, (str(error),)),))
+    artifacts = []
+    remaining = policy['max_batch_size_bytes']
+    for index, artifact in enumerate(manifest['artifacts']):
+        result = inspect_artifact(batch_dir, artifact, policy, remaining,
+                                  within_count=index < policy['max_files_per_batch'])
+        artifacts.append(result)
+        # Only bytes actually read consume the inspection budget. An oversized
+        # rejected object cannot deprive later small artifacts of their budget.
+        if result.sha256:
+            remaining -= result.size_bytes
+    malware = scan_malware_batch(batch_dir, artifacts, policy)
+    artifacts = tuple(apply_malware_result(a, malware[a.artifact_id], policy)
+                      if a.artifact_id in malware else a for a in artifacts)
+    return InspectionResult(batch_dir.name, digest, policy, artifacts,
+                            (CheckResult('manifest'),))

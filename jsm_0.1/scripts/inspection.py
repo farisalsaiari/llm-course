@@ -1,45 +1,49 @@
+"""Inspect pending batches, or explicitly re-inspect one batch."""
+import argparse
+
 from paths import BATCHES_DIR
-
+from src.inspection.config import INSPECTION_CONFIG_PATH, load_inspection_config
 from src.inspection.inspector import inspect_batch
-from src.inspection.report import write_inspection_report
 from src.inspection.quarantine import quarantine_batch
+from src.inspection.report import completed_batches, write_inspection_report
 
 
-if __name__ == "__main__":
-    if not BATCHES_DIR.exists():
-        raise ValueError(f"Batches directory not found: {BATCHES_DIR}")
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('batch_id', nargs='?')
+    parser.add_argument('--latest', action='store_true', help='re-inspect the most recently acquired batch')
+    parser.add_argument('--policy', type=type(INSPECTION_CONFIG_PATH), default=INSPECTION_CONFIG_PATH)
+    args = parser.parse_args()
+    if args.batch_id and args.latest:
+        parser.error('choose a batch ID or --latest')
+    policy = load_inspection_config(args.policy)
+    batches = sorted(p for p in BATCHES_DIR.glob('*') if p.is_dir() or p.is_symlink())
+    if args.batch_id:
+        if '/' in args.batch_id or '\\' in args.batch_id or args.batch_id in {'.', '..'}:
+            parser.error('batch_id must be a directory name')
+        batches = [p for p in batches if p.name == args.batch_id]
+        if not batches:
+            parser.error('batch not found')
+    elif args.latest:
+        batches = sorted(batches, key=lambda p: (p.lstat().st_mtime_ns, p.name))[-1:]
+    else:
+        completed = completed_batches(policy)
+        batches = [p for p in batches if str(p.absolute()) not in completed]
+    if not batches:
+        print('No pending batches. Acquire uploads first, or select a batch to re-inspect.')
+    for batch_dir in batches:
+        result = inspect_batch(batch_dir, policy)
+        report = write_inspection_report(batch_dir, result)
+        quarantine = quarantine_batch(batch_dir, result, report.parent.name)
+        summary = result.summary
+        print(f'{batch_dir.name}: accepted={summary["accepted"]} quarantined={summary["quarantined"]} rejected={summary["rejected"]}')
+        for error in result.errors:
+            print(f'  batch quarantine: {error}')
+        print(f'  report: {report}')
+        if quarantine:
+            print(f'  quarantine: {quarantine}')
+    return 0
 
-    batch_dirs = sorted(
-        path
-        for path in BATCHES_DIR.iterdir()
-        if path.is_dir()
-    )
 
-    if not batch_dirs:
-        raise ValueError(f"No batches found under {BATCHES_DIR}")
-
-    for batch_dir in batch_dirs:
-        result = inspect_batch(batch_dir)
-
-        report_path = write_inspection_report(
-            batch_dir=batch_dir,
-            result=result,
-        )
-
-        if result.passed:
-            print(f"PASS: {batch_dir.name}")
-            print(f"  report: {report_path.name}")
-
-        else:
-            print(f"QUARANTINE: {batch_dir.name}")
-
-            for error in result.errors:
-                print(f"  - {error}")
-
-            quarantine_path = quarantine_batch(
-                batch_dir=batch_dir,
-                result=result,
-            )
-
-            print(f"  report: {report_path.name}")
-            print(f"  quarantine: {quarantine_path}")
+if __name__ == '__main__':
+    raise SystemExit(main())
