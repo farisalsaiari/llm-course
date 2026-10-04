@@ -1,25 +1,47 @@
-from datetime import datetime, timezone
+from paths import UPLOADS_DIR, BATCHES_DIR
 
-from paths import UPLOADS_DIR
+from src.acquisition.intake import read_uploads
 from src.acquisition.batch import acquire_batch
+from src.acquisition.discovery import existing_fingerprints
+from src.acquisition.hashing import sha256_file
 
 
 if __name__ == "__main__":
-    source_files = [
-        path
-        for path in UPLOADS_DIR.iterdir()
-        if path.is_file()
-    ]
+    sources = read_uploads(UPLOADS_DIR)
 
-    source_info = {
-        "source_url": None,
-        "collection_time": datetime.now(timezone.utc).isoformat(),
-        "license_status": "unknown",
-    }
+    if not sources:
+        raise ValueError(f"No files found under {UPLOADS_DIR}")
 
-    batch_dir = acquire_batch(
-        source_files=source_files,
-        source_info=source_info,
-    )
+    existing = existing_fingerprints(BATCHES_DIR)
 
-    print(batch_dir)
+    for source in sources:
+        platform = source.origin.get(
+            "platform",
+            source.name,
+        )
+
+        current_hashes = tuple(
+            sorted(
+                sha256_file(path)
+                for path in source.files
+            )
+        )
+
+        fingerprint = (
+            platform,
+            current_hashes,
+        )
+
+        if fingerprint in existing:
+            print(
+                f"Skipped already acquired source: "
+                f"{source.name}"
+            )
+            continue
+
+        batch_dir = acquire_batch(source)
+
+        print(
+            f"Acquired: {source.name} -> "
+            f"{batch_dir.name}"
+        )
