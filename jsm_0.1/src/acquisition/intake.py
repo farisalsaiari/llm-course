@@ -15,17 +15,34 @@ class IntakeSource:
 
 
 def read_uploads(root: Path) -> list[IntakeSource]:
+    if not root.is_dir():
+        raise ValueError(f"Uploads directory not found: {root}")
+
     sources = []
 
     # Each folder = one source
-    for folder in sorted(path for path in root.iterdir() if path.is_dir()):
+    for folder in sorted(
+        path
+        for path in root.iterdir()
+        if path.is_dir() and not path.name.startswith(".")
+    ):
         origin_path = folder / ORIGIN_FILE
-
         origin = {}
-        if origin_path.exists():
-            origin = json.loads(
-                origin_path.read_text(encoding="utf-8")
-            )
+
+        if origin_path.is_file():
+            try:
+                origin = json.loads(
+                    origin_path.read_text(encoding="utf-8")
+                )
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"Invalid origin.json: {origin_path}"
+                ) from error
+
+            if not isinstance(origin, dict):
+                raise ValueError(
+                    f"{origin_path} must contain a JSON object"
+                )
 
         files = tuple(
             sorted(

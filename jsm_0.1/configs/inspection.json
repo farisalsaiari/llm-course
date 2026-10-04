@@ -1,0 +1,42 @@
+{
+  "max_file_size_bytes": 2147483648,
+  "max_batch_size_bytes": 107374182400,
+  "max_files_per_batch": 100000,
+
+  "max_archive_files": 100000,
+  "max_uncompressed_bytes": 5368709120,
+  "max_compression_ratio": 200,
+
+  "blocked_extensions": [
+    ".exe",
+    ".dll",
+    ".bat",
+    ".cmd",
+    ".com",
+    ".msi",
+    ".ps1",
+    ".sh",
+    ".scr"
+  ],
+
+  "allowed_extensions": [
+    ".txt",
+    ".md",
+    ".pdf",
+    ".docx",
+    ".html",
+    ".htm",
+    ".json",
+    ".csv",
+    ".xml",
+    ".zip"
+  ],
+
+  "unknown_file_policy": "quarantine",
+
+  "known_file_types": {
+    ".pdf": "pdf",
+    ".docx": "zip",
+    ".zip": "zip"
+  }
+}
