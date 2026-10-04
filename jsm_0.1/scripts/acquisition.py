@@ -1,13 +1,14 @@
-from pathlib import Path
 from datetime import datetime, timezone
 
+from paths import UPLOADS_DIR
 from src.acquisition.batch import acquire_batch
 
 
 if __name__ == "__main__":
     source_files = [
-        Path("data/raw/plain1.txt"),
-        Path("data/raw/plain2.txt"),
+        path
+        for path in UPLOADS_DIR.iterdir()
+        if path.is_file()
     ]
 
     source_info = {

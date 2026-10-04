@@ -1,0 +1,23 @@
+{
+  "source": {
+    "source_url": null,
+    "collection_time": "2026-10-04T09:36:28.215064+00:00",
+    "license_status": "unknown"
+  },
+  "files": [
+    {
+      "sequence": 1,
+      "original_name": "plain1.txt",
+      "stored_name": "000001-plain1.txt",
+      "size_bytes": 13,
+      "sha256": "9c54bde9034aac703721908a9722c4b8086bad86a8241f47f5357ce542d70ce7"
+    },
+    {
+      "sequence": 2,
+      "original_name": "plain2.txt",
+      "stored_name": "000002-plain2.txt",
+      "size_bytes": 14,
+      "sha256": "582f4a0eff58d45653135e87a5a4c2b7e84ee19ff43cfeefafafc3577e1bac36"
+    }
+  ]
+}
