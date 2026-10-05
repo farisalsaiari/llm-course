@@ -15,3 +15,23 @@ python -m scripts.filtering
 python -m scripts.deduplication
 
 python -m scripts.dataset_building
+
+python -m scripts.tokenizer_training
+
+for test : 
+python -c "from paths import TOKENIZER_PATH; from src.tokenization.tokenizer import Tokenizer; t=Tokenizer.load(TOKENIZER_PATH); text='مرحبا بالعالم'; ids=t.encode(text, add_special_tokens=True); print(ids); print(t.decode(ids)); assert t.decode(ids)==text; print('PASS')"
+
+python -m scripts.tokenize_dataset
+
+python -m scripts.train
+
+python -m scripts.inference "علي حسن"
+python -m scripts.inference "مشروع"
+
+python -m scripts.evaluate
+
+python -m scripts.serve
+http://127.0.0.1:8000/docs
+
+
+python -m scripts.model_stats

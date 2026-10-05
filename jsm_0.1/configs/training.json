@@ -1,0 +1,6 @@
+{
+  "epochs": 21,
+  "learning_rate": 0.0003,
+  "resume": true,
+  "checkpoint_every_epochs": 1
+}

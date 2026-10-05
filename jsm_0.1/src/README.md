@@ -6,6 +6,8 @@ Immutable Incoming Storage
         ↓
 Inspection / Quarantine
         ↓
+Provenance
+        ↓
 Ingestion
         ↓
 Trusted Raw Storage
@@ -14,6 +16,22 @@ Extraction
         ↓
 Preprocessing
         ↓
-Tokenization
-        ↓
+Dataset Builder
+↓
+Tokenizer training
+↓
+Tokenize dataset
+↓
+Model architecture
+↓
 Training
+↓
+Checkpoint
+↓
+Evaluation
+↓
+Inference
+↓
+API serving
+↓
+LIVE AI MODEL

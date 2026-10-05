@@ -6,3 +6,4 @@ on macOS/Linux:
 source .venv/bin/activate
 
 pip install torch
+pip install fastapi uvicorn
