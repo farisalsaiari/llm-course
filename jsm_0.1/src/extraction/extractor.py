@@ -1,10 +1,14 @@
-from src.ingestion.document import Document
+from pathlib import Path
 
 
-def extract(document: Document) -> Document:
-    if document.source_type == "txt":
-        return document
+def extract_text(file_path: Path) -> str:
+    suffix = file_path.suffix.lower()
+
+    if suffix in {".txt", ".md"}:
+        return file_path.read_text(
+            encoding="utf-8"
+        )
 
     raise ValueError(
-        f"Unsupported source type: {document.source_type}"
+        f"Unsupported extraction type: {suffix}"
     )

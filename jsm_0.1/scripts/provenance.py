@@ -61,7 +61,8 @@ if __name__ == "__main__":
         )
 
         decision = evaluate_training_rights(
-            source_manifest
+            source_manifest,
+            batch_id,
         )
 
         if decision.allowed:
