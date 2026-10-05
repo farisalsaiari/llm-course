@@ -2,10 +2,10 @@
 import argparse
 
 from paths import BATCHES_DIR
-from src.inspection.config import INSPECTION_CONFIG_PATH, load_inspection_config
-from src.inspection.inspector import inspect_batch
-from src.inspection.quarantine import quarantine_batch
-from src.inspection.report import completed_batches, write_inspection_report
+from src.corpus_factory.inspection.config import INSPECTION_CONFIG_PATH, load_inspection_config
+from src.corpus_factory.inspection.inspector import inspect_batch
+from src.corpus_factory.inspection.quarantine import quarantine_batch
+from src.corpus_factory.inspection.report import completed_batches, write_inspection_report
 
 
 def main():

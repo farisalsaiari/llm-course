@@ -12,14 +12,14 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from src.inspection.checks import (
+from src.corpus_factory.inspection.checks import (
     _scan_snapshots, apply_malware_result, inspect_artifact, scan_malware_batch,
 )
-from src.inspection.config import load_inspection_config, validate_inspection_config
-from src.inspection.inspector import inspect_batch
-from src.inspection.quarantine import quarantine_batch
-from src.inspection.report import completed_batches, publish_record, write_inspection_report
-from src.inspection.result import InspectionDecision as D, MalwareScanResult, MalwareScanStatus as M, more_restrictive_decision
+from src.corpus_factory.inspection.config import load_inspection_config, validate_inspection_config
+from src.corpus_factory.inspection.inspector import inspect_batch
+from src.corpus_factory.inspection.quarantine import quarantine_batch
+from src.corpus_factory.inspection.report import completed_batches, publish_record, write_inspection_report
+from src.corpus_factory.inspection.result import InspectionDecision as D, MalwareScanResult, MalwareScanStatus as M, more_restrictive_decision
 
 
 def zip_bytes(members):
@@ -45,7 +45,7 @@ class InspectionTests(unittest.TestCase):
         self.policy = load_inspection_config()
         self.policy['require_malware_scan'] = False
         self.items = []
-        self.scanners = patch('src.inspection.checks.shutil.which', return_value=None)
+        self.scanners = patch('src.corpus_factory.inspection.checks.shutil.which', return_value=None)
         self.scanners.start()
         self.addCleanup(self.scanners.stop)
 
@@ -105,7 +105,7 @@ class InspectionTests(unittest.TestCase):
                         {'source': []}, {'schema_version': 'unknown'}):
             with self.subTest(changes=changes):
                 self.manifest(**changes)
-                with patch('src.inspection.inspector.inspect_artifact') as inspect:
+                with patch('src.corpus_factory.inspection.inspector.inspect_artifact') as inspect:
                     result = inspect_batch(self.batch, self.policy)
                 self.assertFalse(result.batch_valid)
                 self.assertEqual(result.artifacts, ())
@@ -165,7 +165,7 @@ class InspectionTests(unittest.TestCase):
     def test_oversized_file_not_hashed(self):
         item, _ = self.add('huge.txt', b'hello')
         self.policy['max_file_size_bytes'] = 4
-        with patch('src.inspection.checks.stream_hash') as hash_file:
+        with patch('src.corpus_factory.inspection.checks.stream_hash') as hash_file:
             self.assertEqual(self.inspect(item).decision, D.REJECTED)
         hash_file.assert_not_called()
 
@@ -331,7 +331,7 @@ class InspectionTests(unittest.TestCase):
             if command[0] == 'clamdscan':
                 return subprocess.CompletedProcess(command, 2, '', 'daemon unavailable')
             return subprocess.CompletedProcess(command, 1, f'{paths[0]}: OK\n{paths[1]}: Eicar FOUND\n', '')
-        with patch('src.inspection.checks.shutil.which', side_effect=lambda name: name), patch('src.inspection.checks.subprocess.run', side_effect=run) as scanner:
+        with patch('src.corpus_factory.inspection.checks.shutil.which', side_effect=lambda name: name), patch('src.corpus_factory.inspection.checks.subprocess.run', side_effect=run) as scanner:
             result = _scan_snapshots(paths, self.policy)
         self.assertEqual(scanner.call_count, 2)
         self.assertEqual(result[paths[0]].status, M.CLEAN)
@@ -340,9 +340,9 @@ class InspectionTests(unittest.TestCase):
     def test_scanner_missing_verdict_timeout_and_error(self):
         paths = [self.root / '1.txt']
         for response in (subprocess.CompletedProcess([], 0, '', ''), subprocess.CompletedProcess([], 2, f'{paths[0]}: OK\n', 'failed')):
-            with patch('src.inspection.checks.shutil.which', return_value='scanner'), patch('src.inspection.checks.subprocess.run', return_value=response):
+            with patch('src.corpus_factory.inspection.checks.shutil.which', return_value='scanner'), patch('src.corpus_factory.inspection.checks.subprocess.run', return_value=response):
                 self.assertEqual(_scan_snapshots(paths, self.policy)[paths[0]].status, M.ERROR)
-        with patch('src.inspection.checks.shutil.which', return_value='scanner'), patch('src.inspection.checks.subprocess.run', side_effect=subprocess.TimeoutExpired('scanner', 1)):
+        with patch('src.corpus_factory.inspection.checks.shutil.which', return_value='scanner'), patch('src.corpus_factory.inspection.checks.subprocess.run', side_effect=subprocess.TimeoutExpired('scanner', 1)):
             self.assertEqual(_scan_snapshots(paths, self.policy)[paths[0]].status, M.ERROR)
 
     def test_infected_decision_and_changed_snapshot(self):
@@ -362,7 +362,7 @@ class InspectionTests(unittest.TestCase):
         def scan(paths, policy):
             self.assertLessEqual(sum(p.stat().st_size for p in paths), 10)
             return {p: MalwareScanResult(M.CLEAN, 'test') for p in paths}
-        with patch('src.inspection.checks._scan_snapshots', side_effect=scan) as scanner:
+        with patch('src.corpus_factory.inspection.checks._scan_snapshots', side_effect=scan) as scanner:
             result = scan_malware_batch(self.batch, artifacts, self.policy)
         self.assertEqual(scanner.call_count, 3)
         self.assertEqual(len(result), 5)

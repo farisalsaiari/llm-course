@@ -1,5 +1,5 @@
 from paths import PROCESSED_DIR
-from src.preprocessing.filtering import filter_text
+from src.corpus_factory.preprocessing.filtering import filter_text
 
 
 NORMALIZED_DIR = PROCESSED_DIR / "normalized"

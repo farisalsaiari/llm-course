@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from paths import EXTRACTED_DIR, PROCESSED_DIR
-from src.preprocessing.cleaning import clean_text
+from src.corpus_factory.preprocessing.cleaning import clean_text
 
 
 CLEANED_DIR = PROCESSED_DIR / "cleaned"

@@ -6,11 +6,11 @@ from paths import (
     INSPECTIONS_CATALOG_DIR,
 )
 
-from src.ingestion.ingest import (
+from src.corpus_factory.ingestion.ingest import (
     ingest_artifact,
     write_ingestion_manifest,
 )
-from src.provenance.gate import evaluate_training_rights
+from src.corpus_factory.provenance.gate import evaluate_training_rights
 
 
 def load_latest_inspections() -> dict[str, dict]:

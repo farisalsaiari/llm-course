@@ -1,5 +1,5 @@
 from paths import PROCESSED_DIR
-from src.preprocessing.normalization import normalize_text
+from src.corpus_factory.preprocessing.normalization import normalize_text
 
 
 CLEANED_DIR = PROCESSED_DIR / "cleaned"

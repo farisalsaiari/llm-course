@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from paths import RAW_STORAGE_DIR, EXTRACTED_DIR
-from src.extraction.extractor import extract_text
+from src.corpus_factory.extraction.extractor import extract_text
 
 
 if __name__ == "__main__":

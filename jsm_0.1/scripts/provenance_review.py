@@ -1,6 +1,6 @@
 import sys
 
-from src.provenance.decision import write_rights_decision
+from src.corpus_factory.provenance.decision import write_rights_decision
 
 
 if __name__ == "__main__":

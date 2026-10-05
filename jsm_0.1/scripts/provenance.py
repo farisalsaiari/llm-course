@@ -4,7 +4,7 @@ from paths import (
     BATCHES_DIR,
     INSPECTIONS_CATALOG_DIR,
 )
-from src.provenance.gate import evaluate_training_rights
+from src.corpus_factory.provenance.gate import evaluate_training_rights
 
 
 def load_inspection_manifests() -> list[dict]:

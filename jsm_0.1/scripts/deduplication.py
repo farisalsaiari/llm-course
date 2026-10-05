@@ -1,5 +1,5 @@
 from paths import PROCESSED_DIR
-from src.preprocessing.deduplication import text_sha256
+from src.corpus_factory.preprocessing.deduplication import text_sha256
 
 
 FILTERED_DIR = PROCESSED_DIR / "filtered"
