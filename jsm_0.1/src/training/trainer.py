@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from src.dataset.loader import make_training_examples
+from src.evaluation.evaluator import evaluate
 from src.model.config import ModelConfig
 from src.model.model import TinyLLM
 from src.training.checkpoint import save_checkpoint
@@ -29,6 +30,7 @@ def train(
     checkpoint_path: Path,
     training_config: dict,
     resume_checkpoint: dict | None = None,
+    validation_path: Path | None = None,
 ) -> dict:
 
     device = get_device()
@@ -48,6 +50,8 @@ def train(
     tokens_seen = 0
     previous_training_seconds = 0.0
     final_loss = None
+    validation_loss = None
+    best_validation_loss = None
 
     # --------------------------------------------------
     # Resume from checkpoint
@@ -96,6 +100,14 @@ def train(
             "final_loss"
         )
 
+        validation_loss = previous_stats.get(
+            "validation_loss"
+        )
+
+        best_validation_loss = previous_stats.get(
+            "best_validation_loss"
+        )
+
         print(
             f"Resuming from epoch {start_epoch}, "
             f"step {global_step:,}, "
@@ -117,6 +129,8 @@ def train(
             "tokens_seen": tokens_seen,
             "training_seconds": previous_training_seconds,
             "final_loss": final_loss,
+            "validation_loss": validation_loss,
+            "best_validation_loss": best_validation_loss,
             "learning_rate": learning_rate,
         }
 
@@ -126,6 +140,13 @@ def train(
         "checkpoint_every_epochs",
         1,
     )
+
+    keep_last_checkpoints = training_config.get(
+        "keep_last_checkpoints",
+        3,
+    )
+
+    last_saved_epoch = start_epoch
 
     # --------------------------------------------------
     # Training
@@ -179,21 +200,6 @@ def train(
             / steps_this_epoch
         )
 
-        current_training_seconds = (
-            previous_training_seconds
-            + time.perf_counter()
-            - started_at
-        )
-
-        training_stats = {
-            "epochs_completed": epoch,
-            "global_step": global_step,
-            "tokens_seen": tokens_seen,
-            "training_seconds": current_training_seconds,
-            "final_loss": final_loss,
-            "learning_rate": learning_rate,
-        }
-
         print(
             f"Epoch {epoch:03d} "
             f"| loss={final_loss:.4f} "
@@ -209,14 +215,71 @@ def train(
             checkpoint_every_epochs > 0
             and epoch % checkpoint_every_epochs == 0
         ):
+            # --------------------------------------------------
+            # Validation decides the best checkpoint
+            # --------------------------------------------------
+
+            is_best = False
+
+            if (
+                validation_path is not None
+                and validation_path.is_file()
+            ):
+                result = evaluate(
+                    model=model,
+                    config=config,
+                    dataset_path=validation_path,
+                    device=device,
+                )
+
+                model.train()
+
+                if result["available"]:
+                    validation_loss = result["loss"]
+
+                    is_best = (
+                        best_validation_loss is None
+                        or validation_loss
+                        < best_validation_loss
+                    )
+
+                    if is_best:
+                        best_validation_loss = (
+                            validation_loss
+                        )
+
+                    print(
+                        f"Epoch {epoch:03d} "
+                        f"| validation_loss="
+                        f"{validation_loss:.4f}"
+                        f"{' (best)' if is_best else ''}"
+                    )
+
             save_checkpoint(
                 path=checkpoint_path,
                 model=model,
                 optimizer=optimizer,
                 model_config=config,
                 training_config=training_config,
-                training_stats=training_stats,
+                training_stats={
+                    "epochs_completed": epoch,
+                    "global_step": global_step,
+                    "tokens_seen": tokens_seen,
+                    "training_seconds": (
+                        previous_training_seconds
+                        + time.perf_counter()
+                        - started_at
+                    ),
+                    "final_loss": final_loss,
+                    "validation_loss": validation_loss,
+                    "best_validation_loss": best_validation_loss,
+                    "learning_rate": learning_rate,
+                },
+                keep_last=keep_last_checkpoints,
+                is_best=is_best,
             )
+
+            last_saved_epoch = epoch
 
     # --------------------------------------------------
     # Final stats
@@ -234,17 +297,22 @@ def train(
         "tokens_seen": tokens_seen,
         "training_seconds": training_seconds,
         "final_loss": final_loss,
+        "validation_loss": validation_loss,
+        "best_validation_loss": best_validation_loss,
         "learning_rate": learning_rate,
     }
 
-    # Always save final state too.
-    save_checkpoint(
-        path=checkpoint_path,
-        model=model,
-        optimizer=optimizer,
-        model_config=config,
-        training_config=training_config,
-        training_stats=final_stats,
-    )
+    # Save the final state if the last epoch
+    # was not already checkpointed.
+    if last_saved_epoch != epochs:
+        save_checkpoint(
+            path=checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            model_config=config,
+            training_config=training_config,
+            training_stats=final_stats,
+            keep_last=keep_last_checkpoints,
+        )
 
     return final_stats

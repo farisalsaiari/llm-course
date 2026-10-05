@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from paths import PROCESSED_DIR, TRAINING_DATA_DIR
-from src.dataset.builder import choose_split
+from src.dataset.builder import assign_splits
 
 
 DEDUPED_DIR = PROCESSED_DIR / "deduplicated"
@@ -13,6 +13,25 @@ if __name__ == "__main__":
     DATASET_DIR.mkdir(
         parents=True,
         exist_ok=True,
+    )
+
+    documents = [
+        (batch_dir.name, source_file)
+        for batch_dir in sorted(
+            path
+            for path in DEDUPED_DIR.iterdir()
+            if path.is_dir()
+        )
+        for source_file in sorted(
+            batch_dir.glob("*.txt")
+        )
+    ]
+
+    splits = assign_splits(
+        [
+            source_file.stem
+            for _, source_file in documents
+        ]
     )
 
     output_files = {
@@ -30,42 +49,33 @@ if __name__ == "__main__":
     }
 
     try:
-        for batch_dir in sorted(
-            path
-            for path in DEDUPED_DIR.iterdir()
-            if path.is_dir()
-        ):
-            for source_file in sorted(
-                batch_dir.glob("*.txt")
-            ):
-                document_id = source_file.stem
+        for batch_id, source_file in documents:
+            document_id = source_file.stem
 
-                text = source_file.read_text(
-                    encoding="utf-8"
+            text = source_file.read_text(
+                encoding="utf-8"
+            )
+
+            split = splits[document_id]
+
+            record = {
+                "document_id": document_id,
+                "batch_id": batch_id,
+                "text": text,
+            }
+
+            handles[split].write(
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
                 )
+                + "\n"
+            )
 
-                split = choose_split(
-                    document_id
-                )
-
-                record = {
-                    "document_id": document_id,
-                    "batch_id": batch_dir.name,
-                    "text": text,
-                }
-
-                handles[split].write(
-                    json.dumps(
-                        record,
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
-
-                print(
-                    f"{split.upper()}: "
-                    f"{document_id}"
-                )
+            print(
+                f"{split.upper()}: "
+                f"{document_id}"
+            )
 
     finally:
         for handle in handles.values():

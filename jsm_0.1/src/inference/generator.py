@@ -169,6 +169,14 @@ def generate(
             )
         )
 
+    # The token budget can run out in the middle of a
+    # UTF-8 character. Drop the unfinished tail so the
+    # strict decode below cannot fail.
+    while not is_complete_utf8(
+        tokenizer.tokens_to_bytes(token_ids)
+    ):
+        token_ids.pop()
+
     return tokenizer.decode(
         token_ids,
         skip_special_tokens=True,

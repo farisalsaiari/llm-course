@@ -38,7 +38,8 @@ if __name__ == "__main__":
 
                 token_ids = tokenizer.encode(
                     text,
-                    add_special_tokens=True,
+                    add_bos=True,
+                    add_eos=True,
                 )
 
                 tokenized_record = {

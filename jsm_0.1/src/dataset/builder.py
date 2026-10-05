@@ -23,3 +23,28 @@ def choose_split(document_id: str) -> str:
         return "validation"
 
     return "test"
+
+def assign_splits(
+    document_ids: list[str],
+) -> dict[str, str]:
+    """
+    Split every document, keeping train non-empty.
+
+    On a tiny corpus the hash split can leave train
+    with no documents, which makes tokenizer training
+    and model training impossible. In that case every
+    document goes to train.
+    """
+
+    splits = {
+        document_id: choose_split(document_id)
+        for document_id in document_ids
+    }
+
+    if splits and "train" not in splits.values():
+        return {
+            document_id: "train"
+            for document_id in splits
+        }
+
+    return splits

@@ -1,3 +1,4 @@
+import shutil
 from pathlib import Path
 
 import torch
@@ -13,6 +14,8 @@ def save_checkpoint(
     model_config: ModelConfig,
     training_config: dict,
     training_stats: dict,
+    keep_last: int = 3,
+    is_best: bool = False,
 ) -> None:
     path.parent.mkdir(
         parents=True,
@@ -48,34 +51,6 @@ def save_checkpoint(
         },
     }
 
-    epoch = training_stats["epochs_completed"]
-    global_step = training_stats["global_step"]
-
-    # --------------------------------------------------
-    # Historical checkpoint
-    # --------------------------------------------------
-
-    history_path = (
-        path.parent
-        / (
-            f"checkpoint_epoch_{epoch:06d}"
-            f"_step_{global_step:09d}.pt"
-        )
-    )
-
-    history_temporary_path = history_path.with_suffix(
-        history_path.suffix + ".tmp"
-    )
-
-    torch.save(
-        checkpoint,
-        history_temporary_path,
-    )
-
-    history_temporary_path.replace(
-        history_path
-    )
-
     # --------------------------------------------------
     # Latest checkpoint
     # --------------------------------------------------
@@ -92,6 +67,88 @@ def save_checkpoint(
     temporary_path.replace(
         path
     )
+
+    # --------------------------------------------------
+    # Best checkpoint
+    # --------------------------------------------------
+
+    if is_best:
+        copy_checkpoint(
+            path,
+            best_checkpoint_path(path),
+        )
+
+    # --------------------------------------------------
+    # Historical checkpoints
+    # --------------------------------------------------
+
+    if keep_last > 0:
+        epoch = training_stats["epochs_completed"]
+        global_step = training_stats["global_step"]
+
+        copy_checkpoint(
+            path,
+            path.parent
+            / (
+                f"checkpoint_epoch_{epoch:06d}"
+                f"_step_{global_step:09d}.pt"
+            ),
+        )
+
+    prune_history(
+        path.parent,
+        keep_last,
+    )
+
+
+def best_checkpoint_path(path: Path) -> Path:
+    return path.with_name(
+        "best_" + path.name
+    )
+
+
+def copy_checkpoint(
+    source: Path,
+    destination: Path,
+) -> None:
+    temporary_path = destination.with_suffix(
+        destination.suffix + ".tmp"
+    )
+
+    shutil.copyfile(
+        source,
+        temporary_path,
+    )
+
+    temporary_path.replace(
+        destination
+    )
+
+
+def prune_history(
+    checkpoints_dir: Path,
+    keep_last: int,
+) -> None:
+    """
+    Keep only the newest historical checkpoints.
+
+    Names are zero-padded, so sorting by name
+    is sorting by epoch and step.
+    """
+
+    history = sorted(
+        checkpoints_dir.glob(
+            "checkpoint_epoch_*_step_*.pt"
+        )
+    )
+
+    excess = max(
+        len(history) - max(keep_last, 0),
+        0,
+    )
+
+    for old_path in history[:excess]:
+        old_path.unlink()
 
 
 def load_checkpoint(

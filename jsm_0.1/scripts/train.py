@@ -18,6 +18,12 @@ TRAIN_PATH = (
     / "train.jsonl"
 )
 
+VALIDATION_PATH = (
+    TRAINING_DATA_DIR
+    / "tokenized"
+    / "validation.jsonl"
+)
+
 
 if __name__ == "__main__":
     training_config = load_training_config()
@@ -81,6 +87,7 @@ if __name__ == "__main__":
         checkpoint_path=CHECKPOINT_PATH,
         training_config=training_config,
         resume_checkpoint=resume_checkpoint,
+        validation_path=VALIDATION_PATH,
     )
 
     # -----------------------------------------
