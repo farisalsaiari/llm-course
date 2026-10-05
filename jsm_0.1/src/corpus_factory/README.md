@@ -1,0 +1,11 @@
+Acquisition
+↓
+Inspection
+↓
+Provenance
+↓
+Ingestion
+↓
+Extraction
+↓
+Preprocessing

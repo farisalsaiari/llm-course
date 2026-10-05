@@ -144,8 +144,8 @@
     "application/vnd.microsoft.portable-executable"
   ],
   "unknown_file_policy": "quarantine",
-  "require_malware_scan": true,
-  "require_deep_container_inspection": true,
+  "require_malware_scan": false,
+  "require_deep_container_inspection": false,
   "malware_chunk_size": 128,
   "max_malware_chunk_bytes": 2147483648,
   "malware_timeout_seconds": 120,

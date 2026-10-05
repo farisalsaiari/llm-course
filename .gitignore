@@ -1,6 +1,22 @@
-**/__pycache__/
+# Generated/runtime storage
+jsm_0.1/storage/**
+!jsm_0.1/storage/.gitkeep
+
+# Keep test input files
+!jsm_0.1/storage/uploads/
+!jsm_0.1/storage/uploads/**
+
+# Generated model artifacts
+jsm_0.1/artifacts/**
+!jsm_0.1/artifacts/.gitkeep
+
+# Python
+__pycache__/
 *.py[cod]
-.venv
-jsm_0.1/storage/incoming/
-jsm_0.1/storage/catalog/inspections/
-jsm_0.1/storage/quarantine/*/inspection_*/
+.venv/
+venv/
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/

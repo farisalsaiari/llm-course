@@ -1,82 +1,47 @@
-import json
-from pathlib import Path
+from paths import UPLOADS_DIR, BATCHES_DIR
 
-from paths import (
-    BATCHES_DIR,
-    INSPECTIONS_CATALOG_DIR,
-)
-from src.corpus_factory.provenance.gate import evaluate_training_rights
-
-
-def load_inspection_manifests() -> list[dict]:
-    manifests = []
-
-    if not INSPECTIONS_CATALOG_DIR.exists():
-        return manifests
-
-    for manifest_path in sorted(
-        INSPECTIONS_CATALOG_DIR.glob("*/manifest.json")
-    ):
-        manifest = json.loads(
-            manifest_path.read_text(encoding="utf-8")
-        )
-
-        manifest["_manifest_path"] = str(manifest_path)
-
-        manifests.append(manifest)
-
-    return manifests
-
-
-def get_batch_id(inspection: dict) -> str | None:
-    incoming_batch = inspection.get("incoming_batch", {})
-
-    if isinstance(incoming_batch, dict):
-        batch_id = incoming_batch.get("batch_id")
-
-        if batch_id:
-            return batch_id
-
-    # Fallback if current inspector stores it directly
-    return inspection.get("batch_id")
+from src.corpus_factory.acquisition.intake import read_uploads
+from src.corpus_factory.acquisition.batch import acquire_batch
+from src.corpus_factory.acquisition.discovery import existing_fingerprints
+from src.corpus_factory.acquisition.hashing import sha256_file
 
 
 if __name__ == "__main__":
-    inspections = load_inspection_manifests()
+    sources = read_uploads(UPLOADS_DIR)
 
-    print(f"Inspection manifests: {len(inspections)}")
+    if not sources:
+        raise ValueError(f"No files found under {UPLOADS_DIR}")
 
-    for inspection in inspections:
-        batch_id = get_batch_id(inspection)
+    existing = existing_fingerprints(BATCHES_DIR)
 
-        if not batch_id:
+    for source in sources:
+        platform = source.origin.get(
+            "platform",
+            source.name,
+        )
+
+        current_hashes = tuple(
+            sorted(
+                sha256_file(path)
+                for path in source.files
+            )
+        )
+
+        fingerprint = (
+            platform,
+            current_hashes,
+        )
+
+        if fingerprint in existing:
             print(
-                "SKIP: inspection manifest has no incoming batch_id"
+                f"Skipped already acquired source: "
+                f"{source.name}"
             )
             continue
 
-        batch_dir = BATCHES_DIR / batch_id
-        source_path = batch_dir / "source.json"
+        batch_dir = acquire_batch(source)
 
-        if not source_path.is_file():
-            print(
-                f"SKIP: {batch_id} — source.json missing"
-            )
-            continue
-
-        source_manifest = json.loads(
-            source_path.read_text(encoding="utf-8")
+        print(
+            f"Acquired: {source.name} -> "
+            f"{batch_dir.name}"
         )
-
-        decision = evaluate_training_rights(
-            source_manifest
-        )
-
-        if decision.allowed:
-            print(
-                f"ALLOW: {batch_id} — {decision.reason}"
-            )
-        else:
-            print(
-                f"BLOCK: {batch_id} — {decision.reason}"
-            )
